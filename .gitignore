@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 _nero_tmp.wav
 _nero_debug.png
+*.onnx
+*.onnx.json
