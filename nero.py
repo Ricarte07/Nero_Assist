@@ -11,9 +11,14 @@ import re
 import subprocess
 import time
 import wave
+from datetime import date
+
+from duckduckgo_search import DDGS
 
 from dotenv import load_dotenv
 load_dotenv()
+
+import nero_memoria
 
 import pygame
 import speech_recognition as sr
@@ -48,15 +53,31 @@ _CHROME_PROFILE_DIR  = r"C:\Users\m\AppData\Local\Google\Chrome\User Data"
 _CHROME_PROFILE_NAME = "Default"  # mude para "Profile 1", "Profile 2" etc. se necessário
 
 
+_CAPABILITIES = (
+    " Suas capacidades são: "
+    "(1) responder perguntas e conversar normalmente; "
+    "(2) buscar informações atuais na internet automaticamente quando necessário; "
+    "(3) enviar mensagens pelo WhatsApp com o comando 'manda mensagem para [nome] dizendo [mensagem]'; "
+    "(4) memorizar informações pessoais com 'lembra que [info]'; "
+    "(5) apagar memórias com 'esquece [info]'; "
+    "(6) listar memórias com 'o que você sabe sobre mim'; "
+    "(7) modo professor de francês — diga 'modo francês' para ativar e 'modo normal' para voltar. "
+    "Quando perguntado sobre o que você faz ou suas funcionalidades, apresente todas essas capacidades."
+)
+
 SYSTEM_PROMPTS = {
     "default": (
         "Você é Nero, assistente pessoal inteligente e educado do senhor Ricarte. "
         "Responda sempre em português brasileiro, de forma concisa e natural para ser falado em voz alta. "
         "Nunca use listas, markdown ou formatação especial — apenas texto corrido. "
+        "Quando resultados de busca na internet forem fornecidos no contexto entre [BUSCA WEB] e [FIM DA BUSCA], "
+        "use essas informações para responder — elas são atuais e confiáveis. "
+        "NUNCA diga que seus conhecimentos têm limite de data; se precisar de informação atual ela já estará no contexto. "
         "IMPORTANTE: Você JAMAIS deve afirmar que enviou, está enviando ou enviará uma mensagem de WhatsApp. "
         "O envio é feito exclusivamente pelo sistema de automação, não por você. "
         "Se o senhor Ricarte pedir para enviar mensagem e o sistema não confirmar, diga apenas: "
         "'Não consegui processar o comando. Tente dizer: manda mensagem para nome dizendo sua mensagem.'"
+        + _CAPABILITIES
     ),
     "french": (
         "Você é Nero no modo professor de francês do senhor Ricarte. "
@@ -67,6 +88,80 @@ SYSTEM_PROMPTS = {
         "Exemplo de estilo: 'Muito bem! Em francês dizemos: bonjour, ça va? Que significa: olá, tudo bem?'"
     ),
 }
+
+def classify_and_query(message: str, today: str) -> tuple[bool, str]:
+    """
+    Decide em UMA chamada rápida (llama-3.1-8b-instant) se a mensagem precisa
+    de busca na web e, se sim, retorna a query otimizada.
+    Retorna (precisa_busca, query).
+    """
+    try:
+        response = _groq.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"Hoje é {today}. Analise a mensagem e decida se precisa de busca na internet.\n"
+                        "PRECISA de busca: eventos recentes, resultados esportivos, cotações de moeda/cripto, "
+                        "clima/temperatura, notícias, preços de mercado, eleições, lançamentos.\n"
+                        "NÃO precisa: conversas, perguntas gerais, definições, história, ciência, "
+                        "matemática, comandos ao assistente, memória pessoal, opiniões.\n\n"
+                        "Responda EXATAMENTE assim:\n"
+                        "- Se NÃO precisar: responda apenas 'NO'\n"
+                        "- Se precisar: responda apenas a query de busca em português, sem explicações\n"
+                        "Exemplos:\n"
+                        "Mensagem: oi tudo bem? → NO\n"
+                        "Mensagem: resultado do Fortaleza ontem → Fortaleza resultado jogo ontem\n"
+                        "Mensagem: cotação do dólar agora → cotação dólar hoje\n"
+                        "Mensagem: quanto é 2+2 → NO\n"
+                        "Mensagem: previsão do tempo Fortaleza → previsão do tempo Fortaleza hoje"
+                    )
+                },
+                {"role": "user", "content": message}
+            ],
+            max_tokens=25,
+            temperature=0,
+        )
+        result = response.choices[0].message.content.strip()
+        if result.upper() == "NO" or not result:
+            return False, ""
+        print(f"[NERO] Busca detectada, query: '{result}'")
+        return True, result
+    except Exception as e:
+        print(f"[NERO] classify_and_query falhou ({e}), sem busca.")
+        return False, ""
+
+
+def search_web(query: str, max_results: int = 3) -> str:
+    print(f"[NERO] Buscando na web: '{query}'")
+
+    # Tavily — primária (mais confiável, tempo real)
+    tavily_key = os.getenv("TAVILY_API_KEY")
+    if tavily_key:
+        try:
+            from tavily import TavilyClient
+            client = TavilyClient(api_key=tavily_key)
+            response = client.search(query=query, max_results=max_results)
+            results = response.get("results", [])
+            if results:
+                parts = [f"{r['title']}: {r['content']}" for r in results]
+                print(f"[NERO] Tavily: {len(results)} resultado(s)")
+                return "\n\n".join(parts)
+        except Exception as e:
+            print(f"[NERO] Tavily falhou, tentando DuckDuckGo: {e}")
+
+    # DuckDuckGo — fallback
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        if not results:
+            return "Nenhum resultado encontrado para essa busca."
+        parts = [f"{r['title']}: {r['body']}" for r in results]
+        print(f"[NERO] DuckDuckGo: {len(results)} resultado(s)")
+        return "\n\n".join(parts)
+    except Exception as e:
+        return f"Erro na busca: {e}"
 
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -261,11 +356,12 @@ def send_whatsapp_message(contact: str, message: str) -> bool:
             return False
 
         driver.execute_script("arguments[0].click();", search)
-        time.sleep(0.8)
-        search.send_keys(Keys.CONTROL + "a")
-        search.send_keys(Keys.DELETE)
-        time.sleep(0.3)
-        search.send_keys(contact)
+        time.sleep(0.5)
+        driver.execute_script(
+            "arguments[0].innerHTML = ''; arguments[0].focus(); "
+            "document.execCommand('insertText', false, arguments[1]);",
+            search, contact
+        )
         time.sleep(3)
 
         print("[NERO] Clicando no contato...")
@@ -321,7 +417,10 @@ def send_whatsapp_message(contact: str, message: str) -> bool:
 
         driver.execute_script("arguments[0].click();", msg_box)
         time.sleep(0.5)
-        msg_box.send_keys(message)
+        driver.execute_script(
+            "arguments[0].focus(); document.execCommand('insertText', false, arguments[1]);",
+            msg_box, message
+        )
         time.sleep(1)
         msg_box.send_keys(Keys.ENTER)
         time.sleep(1)
@@ -355,16 +454,32 @@ _MAX_HISTORY = 20  # equivale a 10 trocas
 
 
 def ask_groq(message: str, mode: str, history: list) -> str:
+    today = date.today().strftime("%d/%m/%Y")
+    system = SYSTEM_PROMPTS[mode] + nero_memoria.format_for_prompt() + f" A data de hoje é {today}."
+
+    user_content = message
+    needs_search, search_query = classify_and_query(message, today)
+    if needs_search:
+        speak("Um momento, estou buscando essa informação.")
+        web_results = search_web(search_query)
+        user_content = (
+            f"{message}\n\n"
+            f"[BUSCA WEB]\n{web_results}\n[FIM DA BUSCA]"
+        )
+
     messages = (
-        [{"role": "system", "content": SYSTEM_PROMPTS[mode]}]
+        [{"role": "system", "content": system}]
         + history
-        + [{"role": "user", "content": message}]
+        + [{"role": "user", "content": user_content}]
     )
+
     response = _groq.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=messages,
     )
     reply = response.choices[0].message.content
+
+    # Salva no histórico só a mensagem original (sem o bloco de busca)
     history.append({"role": "user", "content": message})
     history.append({"role": "assistant", "content": reply})
     if len(history) > _MAX_HISTORY:
@@ -417,6 +532,12 @@ def conversation_loop(recognizer: sr.Recognizer, microphone: sr.Microphone) -> N
             speak("Abrindo WhatsApp, senhor Ricarte. Aguarde um momento.")
             get_driver()
             speak("WhatsApp aberto. Pode me pedir para enviar mensagens.")
+            continue
+
+        # Verifica se é um comando de memória — responde sem chamar o Groq
+        mem_reply = nero_memoria.handle_command(recognized)
+        if mem_reply is not None:
+            speak(mem_reply)
             continue
 
         contact, inline_message = detect_whatsapp_intent(recognized)
@@ -480,7 +601,7 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n[NERO] Sistema encerrado pelo usuário.")
+        print("\n[NERO] Sistema encerrado pelo usuário")
         if _driver:
             _driver.quit()
         pygame.mixer.quit()

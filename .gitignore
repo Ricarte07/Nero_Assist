@@ -5,3 +5,6 @@ _nero_tmp.wav
 _nero_debug.png
 *.onnx
 *.onnx.json
+nero_history.json
+nero_memoria.json
+ngrok.exe
